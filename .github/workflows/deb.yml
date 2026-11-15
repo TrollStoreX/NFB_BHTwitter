@@ -1,0 +1,188 @@
+name: Build DEB
+
+# Builds only the tweak .deb packages (rootless + rootful).
+# No IPA download, no cyan, no rebranding — the ffmpeg stack is still built
+# because the tweak links its static libraries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: "iOS SDK Version"
+        default: "16.5"
+        required: true
+        type: string
+      target_version:
+        description: "Minimum iOS Version"
+        default: "15.0"
+        required: true
+        type: string
+      variants:
+        description: "Which .deb to build"
+        default: "both"
+        required: true
+        type: choice
+        options:
+          - both
+          - rootless
+          - rootfull
+      commit_id:
+        description: "(Optional) Commit ID to build at"
+        default: ""
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ffmpeg:
+    name: Build ffmpeg Stack
+    runs-on: macos-latest
+    outputs:
+      cache-key: ${{ steps.ffmpeg-key.outputs.key }}
+
+    steps:
+      - name: Checkout Main
+        uses: actions/checkout@v4
+        with:
+          path: main
+          ref: ${{ github.event.inputs.commit_id || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Compute ffmpeg Cache Key
+        id: ffmpeg-key
+        run: |
+          echo "key=ffmpeg-stack-sdk$(xcrun --sdk iphoneos --show-sdk-version)-$(git -C main rev-parse --short HEAD:deps/ffmpeg-kit-next/upstream)-${{ hashFiles('main/deps/ffmpeg-kit-next/build-ffmpeg.sh') }}" >> "$GITHUB_OUTPUT"
+
+      - name: ffmpeg Stack Caching
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ffmpeg-build
+            main/deps/ffmpeg-kit-next/build
+          key: ${{ steps.ffmpeg-key.outputs.key }}
+
+      - name: Build ffmpeg Stack
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: main/deps/ffmpeg-kit-next/build-ffmpeg.sh
+        env:
+          BUILD_DIR: ${{ github.workspace }}/ffmpeg-build
+
+  build:
+    name: Build ${{ matrix.deploy_format }} deb
+    runs-on: macos-latest
+    needs: ffmpeg
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        deploy_format: ${{ fromJSON(inputs.variants == 'both' && '["rootless","rootfull"]' || inputs.variants == 'rootless' && '["rootless"]' || '["rootfull"]') }}
+
+    steps:
+      - name: Checkout Main
+        uses: actions/checkout@v4
+        with:
+          path: main
+          ref: ${{ github.event.inputs.commit_id || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: brew install make dpkg ldid
+
+      - name: Add GNU Make to PATH
+        run: |
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Download Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          path: theos
+          submodules: recursive
+
+      - name: iOS SDK Caching
+        id: SDK
+        uses: actions/cache@v4
+        env:
+          cache-name: iOS-${{ inputs.sdk_version || '16.5' }}-SDK
+        with:
+          path: theos/sdks/
+          key: ${{ env.cache-name }}
+          restore-keys: ${{ env.cache-name }}
+
+      - name: Download iOS SDK
+        if: steps.SDK.outputs.cache-hit != 'true'
+        run: |
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS${{ inputs.sdk_version || '16.5' }}.sdk
+          git checkout
+          mv ./*.sdk "${THEOS}/sdks"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Get Tweak Info
+        id: tweak_info
+        run: |
+          TWEAK_NAME=$(sed -n 's/^Name: *//p' main/control)
+          TWEAK_VERSION=$(awk '/Version:/ {print $2}' main/control)
+          echo "name=${TWEAK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${TWEAK_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git -C main rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "$TWEAK_NAME $TWEAK_VERSION"
+
+      - name: ffmpeg Stack Caching
+        uses: actions/cache@v4
+        with:
+          path: |
+            ffmpeg-build
+            main/deps/ffmpeg-kit-next/build
+          key: ${{ needs.ffmpeg.outputs.cache-key }}
+
+      - name: Build Package
+        run: |
+          cd main
+          sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:${{ inputs.sdk_version || '16.5' }}:${{ inputs.target_version || '15.0' }}/" Makefile
+          ./build.sh --${{ matrix.deploy_format }}
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          BUILD_DIR: ${{ github.workspace }}/ffmpeg-build
+
+      - name: Collect .deb
+        run: |
+          mkdir -p dist
+          found=0
+          for f in main/packages/*.deb; do
+            [ -e "$f" ] || continue
+            found=1
+            # com.nfb.tweak_7.3.1_iphoneos-arm64.deb -> NeoFreeBird_7.3.1_iphoneos-arm64_abc1234.deb
+            arch=$(basename "$f" .deb); arch=${arch##*_}
+            cp "$f" "dist/${{ steps.tweak_info.outputs.name }}_${{ steps.tweak_info.outputs.version }}_${arch}_${{ steps.tweak_info.outputs.commit }}.deb"
+          done
+          [ "$found" = 1 ] || { echo "No .deb produced" >&2; exit 1; }
+          ls -l dist
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tweak_info.outputs.name }}_${{ steps.tweak_info.outputs.version }}_${{ matrix.deploy_format }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: dist/*.deb
